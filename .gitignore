@@ -1,0 +1,34 @@
+# --- Gizli / yerel dosyalar (ASLA GitHub'a atma) ---
+.env
+.env.local
+*.env
+!.env.example
+
+# --- Node çalışma verileri ---
+data/
+logs/
+bin/
+files/
+server/
+__pycache__/
+*.pyc
+*.log
+
+# --- Panel / kullanıcı verileri ---
+users.json
+bot_users.json
+blacklist.json
+ddos_attempts.log
+server_settings.json
+
+# --- Arşivler / yedekler ---
+*.tar
+*.tar.gz
+*.zip
+eski_yedekler/
+gecmis/
+archive-*
+
+# --- OS ---
+.DS_Store
+Thumbs.db
