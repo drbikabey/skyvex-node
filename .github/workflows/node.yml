@@ -1,0 +1,88 @@
+name: SkyVex Node 7/24
+
+# ============================================================
+# NASIL ÇALIŞIR?
+# - GitHub runner'ı ~7 GB RAM (private) / 16 GB RAM (public) verir.
+# - Runner'a dışarıdan bağlantı gelmez; bu yüzden sistem.py kendi
+#   HTTP API'sini "bore" tüneli ile dışarı açar (http://bore.pub:port).
+# - Master panel o adrese /exec atarak sunucu başlatır.
+#
+# ÖNEMLİ SINIRLAR:
+# - Tek job en fazla 6 saat çalışır (aşağıda 350 dk). Cron her saat
+#   yeniden tetikler, böylece kesinti en fazla ~1 saat olur.
+# - Runner diski GEÇİCİDİR; job bitince dünya dosyaları silinir.
+# - 7/24 için public repo önerilir (private = 2000 dk/ay sınırı).
+# - Gerçek kesintisiz + kalıcı çözüm: self-hosted runner / VPS.
+# ============================================================
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Her saat başı (UTC)
+    - cron: "0 * * * *"
+  push:
+    branches: [ "main", "master" ]
+
+concurrency:
+  group: skyvex-node
+  cancel-in-progress: false
+
+jobs:
+  run-node:
+    name: Minecraft Node Agent
+    # --- GERÇEK 7/24 + KALICI DISK İÇİN self-hosted runner ---
+    # runs-on: [self-hosted, linux]
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 350
+
+    env:
+      MASTER_PANEL_URL: ${{ secrets.MASTER_PANEL_URL }}
+      NODE_SECRET: ${{ secrets.NODE_SECRET }}
+      NODE_NAME: ${{ secrets.NODE_NAME }}
+      HEARTBEAT_INTERVAL: "30"
+      # boş bırakılırsa "auto" kullanılır:
+      #   auto/bore -> node API'si bore tüneliyle dışarı açılır (GitHub için ideal)
+      #   fixed     -> PUBLIC_URL / sabit IP (VPS için)
+      #   playit    -> Playit API tüneli (deneysel)
+      TUNNEL_MODE: ${{ secrets.TUNNEL_MODE || 'auto' }}
+      PUBLIC_URL: ${{ secrets.PUBLIC_URL }}
+      PLAYIT_TOKEN: ${{ secrets.PLAYIT_TOKEN }}
+      PLAYIT_DOWNLOAD_URL: ${{ secrets.PLAYIT_DOWNLOAD_URL }}
+      FIXED_IP: ${{ secrets.FIXED_IP }}
+      FIXED_PORT: ${{ secrets.FIXED_PORT }}
+      START_MC_SERVER: ${{ secrets.START_MC_SERVER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bağımlılıkları yükle
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Node agent'ı çalıştır (otomatik yeniden başlatma)
+        run: |
+          set -e
+          echo "🚀 SkyVex Node Agent başlatılıyor..."
+          for i in $(seq 1 100000); do
+            echo "🔁 Başlatma denemesi: $i"
+            python -u sistem.py || true
+            echo "⚠️ Sistem kapandı, 10 saniye sonra yeniden başlatılıyor..."
+            sleep 10
+          done
+
+      - name: Log'ları yükle (hata durumunda)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sistem-log
+          path: logs/sistem.log
+          if-no-files-found: ignore
+          retention-days: 3
