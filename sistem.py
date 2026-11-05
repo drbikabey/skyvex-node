@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import hashlib
 import socket
 import subprocess
 import threading
@@ -19,6 +20,9 @@ from datetime import datetime
 import psutil
 import requests
 from flask import Flask, jsonify, request
+
+# ANSI renk/escape kodları konsolda görünmesin
+ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 try:
     from dotenv import load_dotenv
@@ -102,21 +106,14 @@ for _d in (DATA_DIR, FILES_DIR, LOG_DIR, BIN_DIR):
 
 LOG_FILE = os.path.join(LOG_DIR, "sistem.log")
 
-# Node ID (kalıcı)
+# Node ID (NODE_NAME'den türetilir; job yenilenince değişmez)
 NODE_ID_FILE = os.path.join(DATA_DIR, ".node_id")
-if os.path.exists(NODE_ID_FILE):
-    try:
-        with open(NODE_ID_FILE, "r") as f:
-            NODE_ID = f.read().strip()
-    except Exception:
-        NODE_ID = secrets.token_hex(4)
-else:
-    NODE_ID = secrets.token_hex(4)
-    try:
-        with open(NODE_ID_FILE, "w") as f:
-            f.write(NODE_ID)
-    except Exception:
-        pass
+NODE_ID = hashlib.md5(NODE_NAME.encode("utf-8")).hexdigest()[:8]
+try:
+    with open(NODE_ID_FILE, "w") as f:
+        f.write(NODE_ID)
+except Exception:
+    pass
 
 
 # ====================== LOG ======================
@@ -557,6 +554,8 @@ def enqueue_output(stream, q, username):
     try:
         for line in iter(stream.readline, b""):
             text = line.decode("utf-8", errors="replace")
+            # Renk kodlarını ve satır başı (CR) karakterlerini temizle
+            text = ANSI_ESCAPE_RE.sub("", text).replace("\r\n", "\n").replace("\r", "")
             q.put(text)
             user_console_histories.setdefault(username, []).append(text)
             if len(user_console_histories[username]) > 500:
