@@ -212,21 +212,65 @@ def _java_major_version(java_bin):
     return None
 
 
-def auto_setup_java(preferred_version=21):
-    """Sistemde uygun Java yoksa Temurin JRE indir."""
-    sys_java = shutil.which("java") or shutil.which("java.exe")
-    if sys_java:
-        major = _java_major_version(sys_java)
-        if major and major >= preferred_version:
-            log.info(f"Sistem Java {major} bulundu: {sys_java}")
-            return sys_java
-        log.warning(f"Sistem Java sürümü düşük ({major}), Java {preferred_version} indirilecek.")
+def _java_candidates():
+    """Sistemdeki olası Java çalıştırılabilirlerini listeler."""
+    names = ["java.exe", "java"] if os.name == "nt" else ["java"]
+    cands = []
 
-    for p in ("/usr/bin/java", "/usr/local/bin/java", "/opt/java/bin/java"):
-        if os.path.exists(p):
-            major = _java_major_version(p)
-            if major and major >= preferred_version:
-                return p
+    jh = os.environ.get("JAVA_HOME")
+    if jh:
+        for n in names:
+            p = os.path.join(jh, "bin", n)
+            if os.path.exists(p):
+                cands.append(p)
+
+    for base in ("/usr/lib/jvm", "/opt/java", "/opt", "/usr/local"):
+        try:
+            for d in os.listdir(base):
+                for n in names:
+                    p = os.path.join(base, d, "bin", n)
+                    if os.path.exists(p):
+                        cands.append(p)
+        except Exception:
+            pass
+
+    w = shutil.which("java") or shutil.which("java.exe")
+    if w:
+        cands.append(w)
+    return list(dict.fromkeys(cands))
+
+
+def auto_setup_java(preferred_version=21):
+    """Java 21'i tercih eder.
+
+    ÖNEMLİ: Java 22/23/24/25 Paper 1.21.x ile native crash (SIGSEGV,
+    libasyncProfiler) verebiliyor. Bu yüzden tam olarak Java 21 kullanılır.
+    Sistemde Java 21 yoksa Temurin JRE 21 indirilir.
+    """
+    sys_java = shutil.which("java") or shutil.which("java.exe")
+    sys_major = _java_major_version(sys_java) if sys_java else None
+
+    # 1) Tam eşleşme (Java 21) ara
+    for cand in _java_candidates():
+        major = _java_major_version(cand)
+        if major == preferred_version:
+            log.info(f"Java {major} bulundu: {cand}")
+            return cand
+
+    # 2) Daha eski ama desteklenen sürüm (17) varsa yalnızca 21 yoksa kullan
+    fallback = None
+    for cand in _java_candidates():
+        major = _java_major_version(cand)
+        if major and major < preferred_version and major >= 17:
+            fallback = cand
+
+    if sys_major and sys_major > preferred_version:
+        log.warning(
+            f"Sistem Java {sys_major} tespit edildi; Paper için Java {preferred_version} indirilecek "
+            f"(Java 22+ native crash yapabilir)."
+        )
+    elif sys_major and sys_major < preferred_version:
+        log.warning(f"Sistem Java sürümü düşük ({sys_major}), Java {preferred_version} indirilecek.")
 
     jre_dir = os.path.join(FILES_DIR, "jre")
     version_file = os.path.join(jre_dir, "version.txt")
@@ -293,7 +337,12 @@ def auto_setup_java(preferred_version=21):
         return java_bin
     except Exception as e:
         log.error(f"Java kurulum hatası: {e}")
-        return None
+        if fallback:
+            log.warning(f"Java {preferred_version} indirilemedi, mevcut Java kullanılıyor: {fallback}")
+            return fallback
+        if sys_java:
+            log.warning(f"Java {preferred_version} indirilemedi, sistem Java'sı kullanılıyor: {sys_java} (kararsız olabilir)")
+        return sys_java
 
 
 # ====================== TÜNELLER ======================
@@ -638,6 +687,24 @@ def start_user_server(username, data):
     if TUNNEL_MODE in ("bore", "auto"):
         start_user_tunnel(username, port)
 
+    # Forge kurulumu: master'dan gelen -jar komutunu @args dosyasına çevir
+    forge_args_marker = os.path.join(server_dir, "forge_args.txt")
+    if os.path.exists(forge_args_marker):
+        try:
+            with open(forge_args_marker, "r", encoding="utf-8") as f:
+                rel_args = f.read().strip()
+        except Exception:
+            rel_args = ""
+        args_path = os.path.join(server_dir, rel_args) if rel_args else ""
+        if args_path and os.path.exists(args_path):
+            jvm_args = []
+            for a in (cmd or [])[1:]:
+                if a in ("-jar", SERVER_JAR_NAME, "nogui"):
+                    continue
+                jvm_args.append(a)
+            cmd = [java_path, *jvm_args, f"@{args_path}", "nogui"]
+            log.info(f"Forge args dosyası kullanılıyor: {args_path}")
+
     if cmd and cmd[0].endswith("java"):
         cmd[0] = java_path
     if not cmd:
@@ -724,6 +791,30 @@ def execute_command():
         user_ports.pop(username, None)
         return jsonify({"success": True, "message": "Server stopped"})
 
+    if action == "kill":
+        proc = user_processes.get(username)
+        if proc:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        tun = user_tunnels.pop(username, None)
+        if tun:
+            try:
+                tun.terminate()
+            except Exception:
+                pass
+        user_processes.pop(username, None)
+        user_tunnel_urls.pop(username, None)
+        user_ports.pop(username, None)
+        log.warning(f"⛔ Sunucu zorla kapatıldı (kill): {username}")
+        return jsonify({"success": True, "message": "Server killed"})
+
     if action == "get_console":
         return jsonify({"success": True, "history": user_console_histories.get(username, [])})
 
@@ -762,11 +853,72 @@ def execute_command():
 
 
 # ====================== HEARTBEAT ======================
+def cleanup_disk_if_needed():
+    """Disk %80'i geçtiyse çöp/eski dosyaları temizler. (disk_percent, silinen) döner."""
+    try:
+        disk = psutil.disk_usage(BASE_DIR)
+        percent = disk.percent
+        if percent < 80:
+            return percent, 0
+
+        removed = 0
+        now = time.time()
+
+        # 1) 7 günden eski log dosyaları (aktif sistem.log hariç)
+        try:
+            active_log = os.path.basename(LOG_FILE)
+            for name in os.listdir(LOG_DIR):
+                p = os.path.join(LOG_DIR, name)
+                if os.path.isfile(p) and name != active_log and now - os.path.getmtime(p) > 7 * 86400:
+                    os.remove(p)
+                    removed += 1
+        except Exception:
+            pass
+
+        # 2) Sunucu klasörlerindeki crash dump'ları (hs_err_pid*, core.*)
+        try:
+            for user_dir in os.listdir(FILES_DIR):
+                ud = os.path.join(FILES_DIR, user_dir)
+                if not os.path.isdir(ud):
+                    continue
+                for name in os.listdir(ud):
+                    if name.startswith("hs_err_pid") or name.startswith("core.") or name.startswith("replay_pid"):
+                        try:
+                            os.remove(os.path.join(ud, name))
+                            removed += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 3) data/ içindeki eski arşivler
+        try:
+            for name in os.listdir(DATA_DIR):
+                if not name.endswith((".zip", ".tar", ".tar.gz", ".log")):
+                    continue
+                p = os.path.join(DATA_DIR, name)
+                if os.path.isfile(p) and now - os.path.getmtime(p) > 7 * 86400:
+                    os.remove(p)
+                    removed += 1
+        except Exception:
+            pass
+
+        if removed:
+            log.warning(f"🧹 Disk %{percent:.1f} dolu; {removed} eski dosya temizlendi.")
+        else:
+            log.warning(f"⚠️ Disk %{percent:.1f} dolu; temizlenecek eski dosya bulunamadı.")
+        return percent, removed
+    except Exception as e:
+        log.warning(f"Disk temizleme hatası: {e}")
+        return None, 0
+
+
 def send_heartbeat():
     failures = 0
     while running:
         try:
             info = get_system_info()
+            disk_percent, disk_cleaned = cleanup_disk_if_needed()
             info.update({
                 "secret": NODE_SECRET,
                 "node_id": NODE_ID,
@@ -778,6 +930,8 @@ def send_heartbeat():
                 "fixed_ip": FIXED_IP,
                 "fixed_port": FIXED_PORT,
                 "port": NODE_PORT,
+                "disk_percent": disk_percent,
+                "disk_cleaned": disk_cleaned,
             })
 
             running_users = []
